@@ -32,23 +32,35 @@ Design notes:
   standard viewer, unaffected by this particle's orientation. Added because the context panel's
   oblique, per-particle-rotated cut made it hard to relate a pick back to the tomogram a reviewer
   already knows how to read.
+- Every panel is rendered twice: once as the raw slice (percentile-stretched, as before), and once
+  thresholded (`_apply_threshold`) - shown as a second row below the raw one in the UI, not a
+  replacement. Thresholding first tried CLAHE (adaptive histogram equalization), which was rejected
+  after visual review - it boosts local contrast everywhere, which amplified background noise right
+  along with real structure instead of separating the two. What's there now (`--gaussian-sigma`,
+  `--threshold-percentile` in gps.cli) blurs first, then clips the display range so only the
+  densest upper slice of the (blurred) intensity range shows at all - background collapses to flat
+  black rather than visible speckle. Purely a rendering choice for the reviewer's eyes; never feeds
+  back into what gets shown or any accept/reject logic, and the raw panel is always kept alongside
+  it so nothing is hidden.
 - Re-running `gps prepare` skips any tomogram whose input files and parameters are unchanged since
-  the last run (fingerprinted in gps_review_inputs/<stem>/fingerprint.txt), so an interrupted batch
-  job can be resubmitted without repeating already-finished tomograms.
+  the last run (fingerprinted in gps_review_inputs/<stem>/fingerprint.txt - this includes
+  PANEL_VERSION, bumped whenever the set of files/fields written per particle changes, so an older
+  cache with a different output shape is never silently reused), so an interrupted batch job can be
+  resubmitted without repeating already-finished tomograms.
 - Decisions are saved continuously to gps_review_inputs/decisions.json, so a review session can be
   closed and resumed later without losing progress.
 """
 import hashlib
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import mrcfile
 import starfile
 import typer
 from typing_extensions import Annotated
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import gaussian_filter, map_coordinates
 
 from gps.cli import app, load_star_data, euler_to_rotation_matrix
 
@@ -66,6 +78,11 @@ CONTEXT_BOX_PIXELS = 220
 LAB_X = np.array([1.0, 0.0, 0.0])
 LAB_Y = np.array([0.0, 1.0, 0.0])
 LAB_Z = np.array([0.0, 0.0, 1.0])
+
+#bump whenever the set of files/fields render_review_data_for_tomogram writes per particle changes,
+#so a cache written by an older version (same input files/params, different output shape) is
+#correctly treated as stale instead of being silently reused missing the new fields
+PANEL_VERSION = 2
 
 
 def _file_fingerprint(path: Path) -> str:
@@ -110,8 +127,28 @@ def _extract_slab(tomo: np.ndarray, center: np.ndarray, axis1: np.ndarray, axis2
     return np.mean(slices, axis=0)
 
 
-def _draw_panel(ax, img: np.ndarray, box_a: float, title: str) -> None:
-    vmin, vmax = np.percentile(img, [1, 99])
+def _apply_threshold(img: np.ndarray, gaussian_sigma: float, threshold_percentile: float) -> np.ndarray:
+    """Suppresses background noise so particle-like density stands out, instead of stretching
+    contrast everywhere the way CLAHE does (tried first - amplified noise right along with real
+    structure, judged not useful after visual review). A Gaussian blur first smooths out
+    pixel-level shot noise; the display range is then clipped so only the upper
+    (100 - threshold_percentile) percent of the (smoothed) intensity range is shown at all -
+    background below that collapses to flat black instead of visible speckle, while what's left
+    gets stretched to full contrast. Returns values in [0, 1]. This is a rendering choice, not a
+    detector - it never feeds back into which particles get shown or any accept/reject decision,
+    and the raw, unthresholded panel is always shown alongside it, never replaced."""
+    smoothed = gaussian_filter(img, sigma=gaussian_sigma) if gaussian_sigma > 0 else img
+    lo, hi = np.percentile(smoothed, [threshold_percentile, 99.5])
+    if hi - lo < 1e-6:
+        return np.zeros_like(smoothed)
+    clipped = np.clip(smoothed, lo, hi)
+    return (clipped - lo) / (hi - lo)
+
+
+def _draw_panel(ax, img: np.ndarray, box_a: float, title: str,
+                 vmin: Optional[float] = None, vmax: Optional[float] = None) -> None:
+    if vmin is None or vmax is None:
+        vmin, vmax = np.percentile(img, [1, 99])
     ax.imshow(img, origin='lower', cmap='gray', vmin=vmin, vmax=vmax,
               extent=[-box_a / 2, box_a / 2, -box_a / 2, box_a / 2])
     ax.scatter(0, 0, c='#f9a825', s=90, marker='+', linewidth=2.2, zorder=5)
@@ -122,29 +159,33 @@ def _draw_panel(ax, img: np.ndarray, box_a: float, title: str) -> None:
 
 
 def _save_review_panel(path: Path, img_xy: np.ndarray, img_xz: np.ndarray, img_yz: np.ndarray,
-                        box_a: float) -> None:
+                        box_a: float, vmin: Optional[float] = None, vmax: Optional[float] = None) -> None:
     """Renders the three orthogonal views of the particle's own local frame: xy (looking down the
-    particle's own pointing axis), and the two side views xz/yz, 90 degrees apart around it."""
+    particle's own pointing axis), and the two side views xz/yz, 90 degrees apart around it.
+    vmin/vmax are passed through explicitly (rather than each panel computing its own percentile
+    stretch) when rendering already-normalized thresholded output, which should be displayed as-is."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(1, 3, figsize=(12, 4.2), facecolor='#14191a')
-    _draw_panel(axes[0], img_xy, box_a, "top-down (along particle axis)")
-    _draw_panel(axes[1], img_xz, box_a, "side (x)")
-    _draw_panel(axes[2], img_yz, box_a, "side (y)")
+    _draw_panel(axes[0], img_xy, box_a, "top-down (along particle axis)", vmin, vmax)
+    _draw_panel(axes[1], img_xz, box_a, "side (x)", vmin, vmax)
+    _draw_panel(axes[2], img_yz, box_a, "side (y)", vmin, vmax)
     fig.tight_layout(pad=0.6)
     fig.savefig(path, dpi=105, facecolor=fig.get_facecolor(), bbox_inches='tight', pad_inches=0.08)
     plt.close(fig)
 
 
-def _save_context_panel(path: Path, img: np.ndarray, box_a: float) -> None:
+def _save_context_panel(path: Path, img: np.ndarray, box_a: float,
+                         vmin: Optional[float] = None, vmax: Optional[float] = None) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    if vmin is None or vmax is None:
+        vmin, vmax = np.percentile(img, [1, 99])
     fig, ax = plt.subplots(figsize=(4.6, 4.6), facecolor='#14191a')
-    vmin, vmax = np.percentile(img, [1, 99])
     ax.imshow(img, origin='lower', cmap='gray', vmin=vmin, vmax=vmax,
               extent=[-box_a / 2, box_a / 2, -box_a / 2, box_a / 2])
     ax.scatter(0, 0, c='#f9a825', s=140, marker='+', linewidth=2.6, zorder=5)
@@ -159,6 +200,7 @@ def _save_context_panel(path: Path, img: np.ndarray, box_a: float) -> None:
 def render_review_data_for_tomogram(
     tomo_set: dict, inputs_dir: Path, particles_apx: float, tomo_apx: float,
     box_size_angstrom: float, context_box_size_angstrom: float, slab_slices: int,
+    gaussian_sigma: float, threshold_percentile: float,
 ) -> List[dict]:
     """Called from `gps prepare` (in gps.cli), never directly by this module's own CLI command.
     Renders a review image for every particle in one tomogram's STAR file. Writes one
@@ -178,7 +220,9 @@ def render_review_data_for_tomogram(
 
     params = dict(particles_apx=particles_apx, tomo_apx=tomo_apx,
                   box_size_angstrom=box_size_angstrom,
-                  context_box_size_angstrom=context_box_size_angstrom, slab_slices=slab_slices)
+                  context_box_size_angstrom=context_box_size_angstrom, slab_slices=slab_slices,
+                  gaussian_sigma=gaussian_sigma, threshold_percentile=threshold_percentile,
+                  panel_version=PANEL_VERSION)
     fingerprint = _tomogram_fingerprint(tomo_set, params)
     if records_path.exists() and fingerprint_path.exists() and fingerprint_path.read_text().strip() == fingerprint:
         records = json.loads(records_path.read_text())["records"]
@@ -227,23 +271,41 @@ def render_review_data_for_tomogram(
         filename = f"idx{i}.png"
         _save_review_panel(stem_dir / filename, img_xy, img_xz, img_yz, box_size_angstrom)
 
+        def threshold(im: np.ndarray) -> np.ndarray:
+            return _apply_threshold(im, gaussian_sigma, threshold_percentile)
+
+        enhanced_filename = f"idx{i}_enhanced.png"
+        _save_review_panel(stem_dir / enhanced_filename, threshold(img_xy), threshold(img_xz),
+                           threshold(img_yz), box_size_angstrom, vmin=0.0, vmax=1.0)
+
         context_img = _extract_slab(tomo, pos, x_axis, z_axis, y_axis, context_grid_a,
                                     context_grid_b, slab_slices)
         context_filename = f"idx{i}_context.png"
         _save_context_panel(stem_dir / context_filename, context_img, context_box_size_angstrom)
+
+        context_enhanced_filename = f"idx{i}_context_enhanced.png"
+        _save_context_panel(stem_dir / context_enhanced_filename, threshold(context_img),
+                            context_box_size_angstrom, vmin=0.0, vmax=1.0)
 
         traditional_img = _extract_slab(tomo, pos, LAB_X, LAB_Y, LAB_Z, context_grid_a,
                                         context_grid_b, slab_slices)
         traditional_filename = f"idx{i}_traditional.png"
         _save_context_panel(stem_dir / traditional_filename, traditional_img, context_box_size_angstrom)
 
+        traditional_enhanced_filename = f"idx{i}_traditional_enhanced.png"
+        _save_context_panel(stem_dir / traditional_enhanced_filename, threshold(traditional_img),
+                            context_box_size_angstrom, vmin=0.0, vmax=1.0)
+
         records.append(dict(
             key=f"{stem}:{i}", stem=stem, idx=i,
             lcc=(None if np.isnan(lccmax[i]) else float(lccmax[i])),
             rot=round(float(rot), 2), tilt=round(float(tilt), 2), psi=round(float(psi), 2),
             image=f"/api/image/{stem}/{filename}",
+            image_enhanced=f"/api/image/{stem}/{enhanced_filename}",
             context_image=f"/api/image/{stem}/{context_filename}",
+            context_image_enhanced=f"/api/image/{stem}/{context_enhanced_filename}",
             traditional_image=f"/api/image/{stem}/{traditional_filename}",
+            traditional_image_enhanced=f"/api/image/{stem}/{traditional_enhanced_filename}",
         ))
 
     typer.echo(f"[{stem}] {len(records)} review images ready.")
@@ -342,22 +404,30 @@ INDEX_HTML = r"""<!doctype html>
   header h1 { font-size: 15px; font-weight: 600; margin: 0; color: var(--ink-soft); letter-spacing: 0.02em; }
   #counts { font-family: ui-monospace, monospace; font-size: 13px; color: var(--ink-soft); }
   #counts b.acc { color: var(--teal); } #counts b.rej { color: var(--crimson); }
-  main { flex: 1; display: flex; flex-wrap: wrap; align-items: center; justify-content: center;
-         min-height: 0; padding: 16px; gap: 14px; }
-  #imgwrap { position: relative; border: 3px solid var(--line); border-radius: 10px; overflow: hidden;
-             transition: border-color 0.1s; line-height: 0; background: #14191a; }
+  main { flex: 1; display: grid; grid-template-columns: max-content 260px;
+         grid-template-areas: "row1 meta" "row2 meta"; align-items: center; justify-content: center;
+         gap: 12px 32px; min-height: 0; padding: 16px; overflow-y: auto; }
+  .image-block { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .image-block.raw { grid-area: row1; }
+  .image-block.enhanced { grid-area: row2; }
+  .block-label { align-self: flex-start; font-size: 11px; color: var(--ink-soft);
+                 letter-spacing: 0.06em; text-transform: uppercase; margin-left: 2px; }
+  .image-row { display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap; }
+  .main-wrap { border-radius: 10px; overflow: hidden; line-height: 0; background: #14191a; }
+  .main-img { max-height: 30vh; max-width: 30vw; display: block; }
+  #imgwrap { position: relative; border: 3px solid var(--line); transition: border-color 0.1s; }
   #imgwrap.acc { border-color: var(--teal); } #imgwrap.rej { border-color: var(--crimson); }
-  #img { max-height: 52vh; max-width: 34vw; display: block; }
+  #imgwrap-enh { border: 3px solid var(--line); }
   #badge { position: absolute; top: 10px; right: 10px; padding: 3px 10px; border-radius: 5px;
            font-size: 12px; font-weight: 600; letter-spacing: 0.03em; display: none; }
   #badge.acc { display: block; background: var(--teal); color: #06201d; }
   #badge.rej { display: block; background: var(--crimson); color: #2a0508; }
-  .side-col { display: flex; flex-direction: column; align-items: center; gap: 8px; flex-shrink: 0; }
+  .side-col { display: flex; flex-direction: column; align-items: center; gap: 6px; flex-shrink: 0; }
   .side-wrap { border: 2px solid var(--line); border-radius: 8px; overflow: hidden; line-height: 0;
                background: #14191a; }
-  .side-img { max-height: 32vh; max-width: 14vw; display: block; }
+  .side-img { max-height: 20vh; max-width: 13vw; display: block; }
   .side-label { font-size: 11px; color: var(--ink-soft); letter-spacing: 0.05em; text-transform: uppercase; }
-  #meta { width: 260px; font-size: 14px; line-height: 2.1; flex-shrink: 0; }
+  #meta { grid-area: meta; align-self: center; width: 260px; font-size: 14px; line-height: 2.1; flex-shrink: 0; }
   #meta .row { display: flex; justify-content: space-between; border-bottom: 1px solid var(--line); padding: 2px 0; }
   #meta .label { color: var(--ink-soft); }
   #meta .val { font-family: ui-monospace, monospace; }
@@ -382,14 +452,33 @@ INDEX_HTML = r"""<!doctype html>
 </header>
 <div id="progress-bar"><div id="progress-fill"></div></div>
 <main>
-  <div id="imgwrap"><img id="img" src=""><div id="badge"></div></div>
-  <div class="side-col">
-    <div class="side-wrap"><img class="side-img" id="ctximg" src=""></div>
-    <div class="side-label">context (particle-oriented)</div>
+  <div class="image-block raw">
+    <div class="block-label">raw</div>
+    <div class="image-row">
+      <div class="main-wrap" id="imgwrap"><img class="main-img" id="img" src=""><div id="badge"></div></div>
+      <div class="side-col">
+        <div class="side-wrap"><img class="side-img" id="ctximg" src=""></div>
+        <div class="side-label">context (particle-oriented)</div>
+      </div>
+      <div class="side-col">
+        <div class="side-wrap"><img class="side-img" id="tradimg" src=""></div>
+        <div class="side-label">traditional (tomogram xy)</div>
+      </div>
+    </div>
   </div>
-  <div class="side-col">
-    <div class="side-wrap"><img class="side-img" id="tradimg" src=""></div>
-    <div class="side-label">traditional (tomogram xy)</div>
+  <div class="image-block enhanced">
+    <div class="block-label">thresholded (background suppressed)</div>
+    <div class="image-row">
+      <div class="main-wrap" id="imgwrap-enh"><img class="main-img" id="img-enh" src=""></div>
+      <div class="side-col">
+        <div class="side-wrap"><img class="side-img" id="ctximg-enh" src=""></div>
+        <div class="side-label">context</div>
+      </div>
+      <div class="side-col">
+        <div class="side-wrap"><img class="side-img" id="tradimg-enh" src=""></div>
+        <div class="side-label">traditional</div>
+      </div>
+    </div>
   </div>
   <div id="meta">
     <h2 id="m-title">-</h2>
@@ -433,6 +522,9 @@ function render() {
   document.getElementById('img').src = r.image;
   document.getElementById('ctximg').src = r.context_image;
   document.getElementById('tradimg').src = r.traditional_image;
+  document.getElementById('img-enh').src = r.image_enhanced;
+  document.getElementById('ctximg-enh').src = r.context_image_enhanced;
+  document.getElementById('tradimg-enh').src = r.traditional_image_enhanced;
   document.getElementById('m-title').innerText = r.stem;
   document.getElementById('m-idx').innerText = r.idx;
   document.getElementById('m-lcc').innerText = (r.lcc === null ? '-' : r.lcc.toFixed(2));
@@ -458,6 +550,9 @@ function prefetch() {
       const im = new Image(); im.src = queue[idx + k].image;
       const ctxIm = new Image(); ctxIm.src = queue[idx + k].context_image;
       const tradIm = new Image(); tradIm.src = queue[idx + k].traditional_image;
+      const imEnh = new Image(); imEnh.src = queue[idx + k].image_enhanced;
+      const ctxImEnh = new Image(); ctxImEnh.src = queue[idx + k].context_image_enhanced;
+      const tradImEnh = new Image(); tradImEnh.src = queue[idx + k].traditional_image_enhanced;
     }
   }
 }
