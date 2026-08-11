@@ -53,12 +53,16 @@ Design notes:
   standard viewer, unaffected by this particle's orientation. Added because the context panel's
   oblique, per-particle-rotated cut made it hard to relate a pick back to the tomogram a reviewer
   already knows how to read.
-- There used to be a second, "thresholded" row below the raw one (Gaussian blur + percentile
-  clipping, and before that CLAHE) meant to help tell particle density apart from background noise.
-  Both were tried, shown to the user, and judged not to actually help - removed entirely (rendering
-  function, CLI options, dependency, UI row) rather than kept as an unused option. Don't re-add
-  either without new user-driven motivation; see git history if a future request wants a similar
-  idea revisited.
+- Optional background-suppressing thresholding (`--threshold` in gps.cli): a light denoising blur
+  (`PREVIEW_GAUSSIAN_SIGMA`) followed by clipping the display range so only the upper
+  `(100 - threshold)` percent of the (blurred) intensity range renders at all - everything below
+  goes flat black instead of visible speckle. Two earlier, different approaches to this same goal
+  (CLAHE, then an always-on second UI row with this same blur+clip) were each tried and removed
+  after being judged not to help. What's here now is deliberately opt-in and single-row: off by
+  default (plain percentile-stretch display), and when set, replaces the display windowing on every
+  panel rather than adding a second row - `--preview-thresholds` renders a small gallery across
+  10/20/.../90 percent on a few random particles first, so a value can be picked visually before
+  committing to a full `--threshold`-flagged run.
 - Re-running `gps prepare` skips any tomogram whose input files and parameters are unchanged since
   the last run (fingerprinted in gps_review_inputs/<stem>/fingerprint.txt - this includes
   PANEL_VERSION, bumped whenever the set of files/fields written per particle changes, so an older
@@ -69,15 +73,16 @@ Design notes:
 """
 import hashlib
 import json
+import random
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import mrcfile
 import starfile
 import typer
 from typing_extensions import Annotated
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import gaussian_filter, map_coordinates
 
 from gps.cli import app, load_star_data, euler_to_rotation_matrix, z_vector_to_rot_tilt
 
@@ -104,6 +109,14 @@ PANEL_VERSION = 4
 #how long, as a fraction of box_size_angstrom, the redrawn correction arrow appears on each panel
 #for a fully-aligned (direction-cosine 1.0) component - see build_review_app's /api/correct
 ARROW_DISPLAY_FRACTION = 0.35
+
+#denoising blur applied before thresholding (--threshold and --preview-thresholds) - fixed rather
+#than exposed as its own CLI flag, since it's just there to stop the percentile cutoff from picking
+#out individual noise spikes, not a creative parameter worth its own knob
+PREVIEW_GAUSSIAN_SIGMA = 1.0
+
+#the fixed sweep --preview-thresholds renders per sampled particle
+PREVIEW_THRESHOLDS = list(range(10, 91, 10))
 
 
 def _file_fingerprint(path: Path) -> str:
@@ -148,18 +161,36 @@ def _extract_slab(tomo: np.ndarray, center: np.ndarray, axis1: np.ndarray, axis2
     return np.mean(slices, axis=0)
 
 
-def _save_single_panel(path: Path, img: np.ndarray, box_a: float, pixels: int) -> None:
+def _apply_threshold(img: np.ndarray, gaussian_sigma: float, threshold_percentile: float) -> np.ndarray:
+    """Suppresses background noise so particle-like density stands out: a Gaussian blur first
+    smooths out pixel-level shot noise, then the display range is clipped so only the upper
+    (100 - threshold_percentile) percent of the (blurred) intensity range is shown at all -
+    background below that collapses to flat black instead of visible speckle, while what's left
+    gets stretched to full contrast. Returns values in [0, 1]. Purely a rendering choice - never
+    feeds back into which particles get shown or any accept/reject decision."""
+    smoothed = gaussian_filter(img, sigma=gaussian_sigma) if gaussian_sigma > 0 else img
+    lo, hi = np.percentile(smoothed, [threshold_percentile, 99.5])
+    if hi - lo < 1e-6:
+        return np.zeros_like(smoothed)
+    clipped = np.clip(smoothed, lo, hi)
+    return (clipped - lo) / (hi - lo)
+
+
+def _save_single_panel(path: Path, img: np.ndarray, box_a: float, pixels: int,
+                        vmin: Optional[float] = None, vmax: Optional[float] = None) -> None:
     """Saves one clean panel - no title, ticks, spines, or padding, just the image and the amber
     crosshair - filling the figure edge-to-edge at an exact pixel size, so a browser click on the
     resulting PNG maps back to an Angstrom position by simple linear interpolation (no tight-bbox
     cropping uncertainty to account for). Used for the top-down/side (x)/side (y) panels, which is
     what the review UI's click-to-correct-orientation workflow needs pixel-accurate coordinates
-    from (see build_review_app's /api/correct)."""
+    from (see build_review_app's /api/correct). vmin/vmax are passed through explicitly (rather
+    than computing a percentile stretch here) when rendering already-normalized thresholded output."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    vmin, vmax = np.percentile(img, [1, 99])
+    if vmin is None or vmax is None:
+        vmin, vmax = np.percentile(img, [1, 99])
     dpi = 100
     fig = plt.figure(figsize=(pixels / dpi, pixels / dpi), dpi=dpi, facecolor='#14191a')
     ax = fig.add_axes([0, 0, 1, 1])
@@ -173,12 +204,14 @@ def _save_single_panel(path: Path, img: np.ndarray, box_a: float, pixels: int) -
     plt.close(fig)
 
 
-def _save_context_panel(path: Path, img: np.ndarray, box_a: float) -> None:
+def _save_context_panel(path: Path, img: np.ndarray, box_a: float,
+                         vmin: Optional[float] = None, vmax: Optional[float] = None) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    vmin, vmax = np.percentile(img, [1, 99])
+    if vmin is None or vmax is None:
+        vmin, vmax = np.percentile(img, [1, 99])
     fig, ax = plt.subplots(figsize=(4.6, 4.6), facecolor='#14191a')
     ax.imshow(img, origin='lower', cmap='gray', vmin=vmin, vmax=vmax,
               extent=[-box_a / 2, box_a / 2, -box_a / 2, box_a / 2])
@@ -191,9 +224,42 @@ def _save_context_panel(path: Path, img: np.ndarray, box_a: float) -> None:
     plt.close(fig)
 
 
+def _draw_sweep_cell(ax, img: np.ndarray, box_a: float, title: str,
+                      vmin: Optional[float] = None, vmax: Optional[float] = None) -> None:
+    if vmin is None or vmax is None:
+        vmin, vmax = np.percentile(img, [1, 99])
+    ax.imshow(img, origin='lower', cmap='gray', vmin=vmin, vmax=vmax,
+              extent=[-box_a / 2, box_a / 2, -box_a / 2, box_a / 2])
+    ax.scatter(0, 0, c='#f9a825', s=60, marker='+', linewidth=1.8, zorder=5)
+    ax.set_title(title, fontsize=10, color='#c7d0d1')
+    ax.set_xticks([]); ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+
+def _save_threshold_sweep_panel(path: Path, raw_img: np.ndarray,
+                                 threshold_imgs: List[tuple], box_a: float) -> None:
+    """One row per particle for --preview-thresholds: the raw side (x) slice, then that same slice
+    thresholded at each percentile in threshold_imgs (a list of (percentile, image) pairs), so a
+    reviewer can compare them side by side and pick a --threshold value for the full run."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = 1 + len(threshold_imgs)
+    fig, axes = plt.subplots(1, n, figsize=(2.3 * n, 2.6), facecolor='#14191a')
+    _draw_sweep_cell(axes[0], raw_img, box_a, "raw")
+    for ax, (pct, img) in zip(axes[1:], threshold_imgs):
+        _draw_sweep_cell(ax, img, box_a, f"threshold={pct:.0f}", vmin=0.0, vmax=1.0)
+    fig.tight_layout(pad=0.5)
+    fig.savefig(path, dpi=100, facecolor=fig.get_facecolor(), bbox_inches='tight', pad_inches=0.08)
+    plt.close(fig)
+
+
 def render_review_data_for_tomogram(
     tomo_set: dict, inputs_dir: Path, particles_apx: float, tomo_apx: float,
     box_size_angstrom: float, context_box_size_angstrom: float, slab_slices: int,
+    threshold: Optional[float],
 ) -> List[dict]:
     """Called from `gps prepare` (in gps.cli), never directly by this module's own CLI command.
     Renders a review image for every particle in one tomogram's STAR file. Writes one
@@ -214,7 +280,7 @@ def render_review_data_for_tomogram(
     params = dict(particles_apx=particles_apx, tomo_apx=tomo_apx,
                   box_size_angstrom=box_size_angstrom,
                   context_box_size_angstrom=context_box_size_angstrom, slab_slices=slab_slices,
-                  panel_version=PANEL_VERSION)
+                  threshold=threshold, panel_version=PANEL_VERSION)
     fingerprint = _tomogram_fingerprint(tomo_set, params)
     if records_path.exists() and fingerprint_path.exists() and fingerprint_path.read_text().strip() == fingerprint:
         records = json.loads(records_path.read_text())["records"]
@@ -260,25 +326,39 @@ def render_review_data_for_tomogram(
         img_xz = _extract_slab(tomo, pos, x_axis, z_axis, y_axis, grid_a, grid_b, slab_slices)
         img_yz = _extract_slab(tomo, pos, y_axis, z_axis, x_axis, grid_a, grid_b, slab_slices)
 
+        #when --threshold is set, every panel's *display* is background-suppressed (blur + clip,
+        #see _apply_threshold) instead of the plain percentile stretch - vmin/vmax=(0,1) since
+        #_apply_threshold's output is already normalized to that range
+        def display(im: np.ndarray):
+            if threshold is None:
+                return im, None, None
+            return _apply_threshold(im, PREVIEW_GAUSSIAN_SIGMA, threshold), 0.0, 1.0
+
         #saved as 3 separate clean-edge images, not one composite, so a click in the review UI's
         #top-down/side (x)/side (y) panel maps back to an exact Angstrom position - see
         #_save_single_panel and build_review_app's /api/correct
         topdown_filename = f"idx{i}_topdown.png"
         sidex_filename = f"idx{i}_sidex.png"
         sidey_filename = f"idx{i}_sidey.png"
-        _save_single_panel(stem_dir / topdown_filename, img_xy, box_size_angstrom, BOX_PIXELS)
-        _save_single_panel(stem_dir / sidex_filename, img_xz, box_size_angstrom, BOX_PIXELS)
-        _save_single_panel(stem_dir / sidey_filename, img_yz, box_size_angstrom, BOX_PIXELS)
+        disp_xy, vmin, vmax = display(img_xy)
+        disp_xz, _, _ = display(img_xz)
+        disp_yz, _, _ = display(img_yz)
+        _save_single_panel(stem_dir / topdown_filename, disp_xy, box_size_angstrom, BOX_PIXELS, vmin, vmax)
+        _save_single_panel(stem_dir / sidex_filename, disp_xz, box_size_angstrom, BOX_PIXELS, vmin, vmax)
+        _save_single_panel(stem_dir / sidey_filename, disp_yz, box_size_angstrom, BOX_PIXELS, vmin, vmax)
 
         context_img = _extract_slab(tomo, pos, x_axis, z_axis, y_axis, context_grid_a,
                                     context_grid_b, slab_slices)
         context_filename = f"idx{i}_context.png"
-        _save_context_panel(stem_dir / context_filename, context_img, context_box_size_angstrom)
+        disp_context, vmin, vmax = display(context_img)
+        _save_context_panel(stem_dir / context_filename, disp_context, context_box_size_angstrom, vmin, vmax)
 
         traditional_img = _extract_slab(tomo, pos, LAB_X, LAB_Y, LAB_Z, context_grid_a,
                                         context_grid_b, slab_slices)
         traditional_filename = f"idx{i}_traditional.png"
-        _save_context_panel(stem_dir / traditional_filename, traditional_img, context_box_size_angstrom)
+        disp_traditional, vmin, vmax = display(traditional_img)
+        _save_context_panel(stem_dir / traditional_filename, disp_traditional,
+                            context_box_size_angstrom, vmin, vmax)
 
         records.append(dict(
             key=f"{stem}:{i}", stem=stem, idx=i,
@@ -294,6 +374,60 @@ def render_review_data_for_tomogram(
 
     typer.echo(f"[{stem}] {len(records)} review images ready.")
     return _finish(records)
+
+
+def render_threshold_preview(
+    tomo_sets: List[dict], preview_dir: Path, particles_apx: float, tomo_apx: float,
+    box_size_angstrom: float, slab_slices: int, n_particles: int, thresholds: List[float],
+) -> List[dict]:
+    """Called from `gps prepare --preview-thresholds` (in gps.cli). Randomly samples n_particles
+    particles from across all of tomo_sets, and for each writes one PNG - its side (x) slice raw,
+    next to itself thresholded at every percentile in `thresholds` - to preview_dir, so a --threshold
+    value can be picked visually before committing to it for a full render. Uses the exact same
+    extraction pipeline (_extract_slab, same box size/slab-slices) as the real render, so the
+    preview is representative of what --threshold would actually produce; never touches
+    gps_review_inputs/ or writes anything gps review reads."""
+    preview_dir.mkdir(parents=True, exist_ok=True)
+
+    pool = []
+    star_cache: Dict[str, tuple] = {}
+    for tomo_set in tomo_sets:
+        df, _, _ = load_star_data(tomo_set['starfile'])
+        star_cache[tomo_set['stem']] = df
+        pool.extend((tomo_set, i) for i in range(len(df)))
+
+    sampled = random.sample(pool, min(n_particles, len(pool)))
+
+    scaling_factor = particles_apx / tomo_apx
+    half_width_vox = (box_size_angstrom / 2) / tomo_apx
+    grid_1d = np.linspace(-half_width_vox, half_width_vox, BOX_PIXELS)
+    grid_b, grid_a = np.meshgrid(grid_1d, grid_1d, indexing='ij')
+
+    tomo_cache: Dict[str, np.ndarray] = {}
+    written = []
+    for tomo_set, i in sampled:
+        stem = tomo_set['stem']
+        if stem not in tomo_cache:
+            typer.echo(f"[{stem}] loading tomogram density...")
+            with mrcfile.open(tomo_set['tomogram'], permissive=True) as mrc:
+                tomo_cache[stem] = np.asarray(mrc.data, dtype=np.float32)
+        tomo = tomo_cache[stem]
+        df = star_cache[stem]
+
+        row = df.iloc[i]
+        pos = np.array([row['rlnCoordinateX'], row['rlnCoordinateY'], row['rlnCoordinateZ']]) * scaling_factor
+        frame = euler_to_rotation_matrix(row['rlnAngleRot'], row['rlnAngleTilt'], row['rlnAnglePsi'])
+        x_axis, y_axis, z_axis = frame[:, 0], frame[:, 1], frame[:, 2]
+
+        img_xz = _extract_slab(tomo, pos, x_axis, z_axis, y_axis, grid_a, grid_b, slab_slices)
+        threshold_imgs = [(pct, _apply_threshold(img_xz, PREVIEW_GAUSSIAN_SIGMA, pct)) for pct in thresholds]
+
+        out_path = preview_dir / f"{stem}_idx{i}_threshold_preview.png"
+        _save_threshold_sweep_panel(out_path, img_xz, threshold_imgs, box_size_angstrom)
+        typer.echo(f"[{stem}:{i}] wrote {out_path.name}")
+        written.append(dict(stem=stem, idx=i, path=str(out_path)))
+
+    return written
 
 
 def build_review_app(all_records: List[dict], inputs_dir: Path, tomogram_starfiles: Dict[str, Path]):

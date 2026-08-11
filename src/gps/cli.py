@@ -6,7 +6,7 @@ import pandas as pd
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing_extensions import Annotated
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 app = typer.Typer(help="GPS: Screen particle picks from a pytom/RELION-style STAR file by eye.")
 
@@ -93,6 +93,7 @@ def discover_tomogram_sets(data_dir: Path) -> List[dict]:
 def _process_tomogram_for_prepare(
     tomo_set: dict, inputs_dir: Path, particles_apx: float, tomo_apx: float,
     box_size_angstrom: float, context_box_size_angstrom: float, slab_slices: int,
+    threshold: Optional[float],
 ) -> dict:
     """Renders review images for every particle in one tomogram and writes them to
     inputs_dir/<stem>/. Returns a small summary dict for the CLI's own progress reporting."""
@@ -102,7 +103,7 @@ def _process_tomogram_for_prepare(
     from gps.review import render_review_data_for_tomogram
     records = render_review_data_for_tomogram(
         tomo_set, inputs_dir, particles_apx, tomo_apx, box_size_angstrom, context_box_size_angstrom,
-        slab_slices,
+        slab_slices, threshold,
     )
     return dict(stem=tomo_set['stem'], n_particles=len(records))
 
@@ -130,6 +131,26 @@ def prepare(
                                 "membrane-like features without much smearing, since a real "
                                 "feature stays roughly in place across nearby depths while noise "
                                 "doesn't. 1 (the default) renders a single ordinary slice.")] = 1,
+    threshold: Annotated[
+        Optional[float], typer.Option("--threshold",
+                             help="Apply background-suppressing threshold display to every panel: "
+                                  "a light denoising blur, then pixels below this percentile of the "
+                                  "(blurred) intensity range render as flat black instead of visible "
+                                  "speckle. Omitted (default): plain percentile-stretch display, no "
+                                  "thresholding. Use --preview-thresholds first to pick a value.")] = None,
+    preview_thresholds: Annotated[
+        bool, typer.Option("--preview-thresholds",
+                            help="Instead of a full render, write a quick gallery to "
+                                 "data_dir/gps_threshold_preview/: for --preview-particles randomly "
+                                 "sampled particles, their side (x) slice next to itself thresholded "
+                                 "at 10/20/.../90 percent, so a good --threshold value can be picked "
+                                 "visually before committing to a full run. Respects --slab-slices "
+                                 "so the preview matches what a real run would produce. Exits "
+                                 "without doing the normal per-particle render.")] = False,
+    preview_particles: Annotated[
+        int, typer.Option("--preview-particles",
+                           help="Number of randomly sampled particles to include in the "
+                                "--preview-thresholds gallery.")] = 10,
     workers: Annotated[
         int, typer.Option("--workers", "-j",
                            help="Number of tomograms to render in parallel (they're fully "
@@ -142,6 +163,9 @@ def prepare(
     tomogram density image oriented to that particle's own orientation - no analysis or automatic
     accept/reject, every particle goes to manual review. Writes to data_dir/gps_review_inputs/.
     Run `gps review data_dir` afterwards to triage the results by eye.
+
+    Pass --preview-thresholds first if you want background-suppressing thresholding (see
+    --threshold) - it writes a quick gallery to pick a value from instead of doing a full render.
     """
     if not data_dir.is_dir():
         typer.echo(f"Input Error: {data_dir} is not a directory", err=True)
@@ -169,6 +193,14 @@ def prepare(
         typer.echo(f"Input Error: --slab-slices must be at least 1, got {slab_slices}", err=True)
         raise typer.Exit(code=1)
 
+    if threshold is not None and not 0 < threshold < 100:
+        typer.echo(f"Input Error: --threshold must be between 0 and 100, got {threshold}", err=True)
+        raise typer.Exit(code=1)
+
+    if preview_particles < 1:
+        typer.echo(f"Input Error: --preview-particles must be at least 1, got {preview_particles}", err=True)
+        raise typer.Exit(code=1)
+
     if workers < 1:
         typer.echo("Input Error: --workers must be at least 1", err=True)
         raise typer.Exit(code=1)
@@ -179,6 +211,21 @@ def prepare(
         typer.echo(f"Input Error: {e}", err=True)
         raise typer.Exit(code=1)
 
+    if preview_thresholds:
+        from gps.review import render_threshold_preview, PREVIEW_THRESHOLDS
+        preview_dir = data_dir / "gps_threshold_preview"
+        typer.echo(f"Rendering threshold preview for {preview_particles} randomly sampled "
+                   f"particle(s) across {len(tomo_sets)} tomogram(s), at thresholds "
+                   f"{PREVIEW_THRESHOLDS}...")
+        written = render_threshold_preview(
+            tomo_sets, preview_dir, particles_apx, tomo_apx, box_size_angstrom, slab_slices,
+            preview_particles, PREVIEW_THRESHOLDS,
+        )
+        typer.echo(f"\nWrote {len(written)} preview image(s) to {preview_dir}.")
+        typer.echo("Pick a threshold from these, then re-run without --preview-thresholds and "
+                   "with --threshold <value> for the full render.")
+        raise typer.Exit(code=0)
+
     typer.echo(f"Found {len(tomo_sets)} tomogram(s) to prepare: {[s['stem'] for s in tomo_sets]}")
 
     inputs_dir = data_dir / "gps_review_inputs"
@@ -188,6 +235,7 @@ def prepare(
         _process_tomogram_for_prepare, inputs_dir=inputs_dir, particles_apx=particles_apx,
         tomo_apx=tomo_apx, box_size_angstrom=box_size_angstrom,
         context_box_size_angstrom=context_box_size_angstrom, slab_slices=slab_slices,
+        threshold=threshold,
     )
     if workers == 1 or len(tomo_sets) == 1:
         summaries = [process_one(tomo_set) for tomo_set in tomo_sets]

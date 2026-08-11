@@ -67,9 +67,26 @@ Pixel sizes are required since the tomogram and particle coordinates are often b
 | `--box-size-angstrom` | 300 Å | Width/height of the three close-up panels. |
 | `--context-box-size-angstrom` | 2000 Å | Width/height of the two wider panels (context and traditional). |
 | `--slab-slices` | 1 (off) | Average this many parallel slices along each panel's own depth axis instead of one slice, to cut noise. |
+| `--threshold` | off | Background-suppressing display: blur, then clip so only the top `(100 - threshold)`% of intensity shows at all, everything else flat black. Applies to every panel. |
+| `--preview-thresholds` | off | Skip the full render; instead write a quick gallery for `--preview-particles` random particles to `data_dir/gps_threshold_preview/`, each at every threshold from 10 to 90, to pick a `--threshold` value from. |
+| `--preview-particles` | 10 | Number of particles sampled for `--preview-thresholds`. |
 | `--workers` / `-j` | 4 | Number of tomograms rendered in parallel - they're fully independent of each other. `--workers 1` disables parallelism. |
 
 Run `gps prepare --help` for the full list.
+
+#### Picking a `--threshold`
+
+Raw tomogram slices are often too noisy to easily tell a particle apart from background. Rather
+than guess a threshold value, preview a few first:
+
+```bash
+gps prepare /path/to/data_dir --particles_apx 3.728 --tomo_apx 7.456 --preview-thresholds
+```
+
+This writes one PNG per sampled particle to `data_dir/gps_threshold_preview/` - its side (x) slice
+raw, next to itself thresholded at 10, 20, ..., 90 percent - and exits without doing a full render.
+Once you've picked a value from those, run the real `gps prepare` with `--threshold <value>` (and
+the same `--slab-slices`, if you're using it, so the preview stays representative of the full run).
 
 `--workers` parallelizes across tomograms using Python's `ProcessPoolExecutor`, which only spreads
 work across CPU cores on the single machine the command is running on - it cannot reach across
