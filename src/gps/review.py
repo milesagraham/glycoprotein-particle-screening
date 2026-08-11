@@ -612,7 +612,7 @@ INDEX_HTML = r"""<!doctype html>
 <div id="progress-bar"><div id="progress-fill"></div></div>
 <main>
   <div class="image-block raw">
-    <div class="block-label">raw &middot; click base then apex on any panel(s), enter to save</div>
+    <div class="block-label">raw &middot; click base then apex on any panel(s) to annotate, enter to accept</div>
     <div class="image-row">
       <div class="raw-group" id="imgwrap">
         <div class="panel-cell">
@@ -674,9 +674,9 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </main>
 <footer>
-  <span><kbd>space</kbd> accept &nbsp; <kbd>del</kbd>/<kbd>backspace</kbd> reject &nbsp;
-        <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> navigate &nbsp; <kbd>z</kbd> undo &nbsp;
-        <kbd>enter</kbd> save annotation (also accepts)</span>
+  <span><kbd>enter</kbd> accept (or save annotation, if any) &nbsp;
+        <kbd>del</kbd>/<kbd>backspace</kbd> reject &nbsp;
+        <kbd>&larr;</kbd>/<kbd>&rarr;</kbd> navigate &nbsp; <kbd>z</kbd> undo</span>
   <span id="progress-text">0 / 0</span>
 </footer>
 <script>
@@ -891,12 +891,15 @@ async function doExport() {
 }
 
 document.addEventListener('keydown', (e) => {
-  if (e.code === 'Space') { e.preventDefault(); decide('accept'); }
-  else if (e.code === 'Backspace' || e.code === 'Delete') { e.preventDefault(); decide('reject'); }
+  if (e.code === 'Backspace' || e.code === 'Delete') { e.preventDefault(); decide('reject'); }
   else if (e.code === 'ArrowRight') navigate(1);
   else if (e.code === 'ArrowLeft') navigate(-1);
   else if (e.key === 'z' || e.key === 'Z') undo();
-  else if (e.key === 'Enter') { e.preventDefault(); saveCorrection(); }
+  else if (e.key === 'Enter') {
+    e.preventDefault();
+    const hasAnnotation = PANEL_AXES.some((axis) => pendingClicks[axis] && pendingClicks[axis].apex);
+    if (hasAnnotation) saveCorrection(); else decide('accept');
+  }
 });
 
 PANEL_AXES.forEach((axis) => {

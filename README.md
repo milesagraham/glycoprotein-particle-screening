@@ -175,9 +175,10 @@ Once `gps review` is running:
   ssh -L 5050:localhost:5050 user@cluster-host
   ```
   then open `http://localhost:5050` locally.
-- `space` accepts the current particle and advances; `Backspace`/`Delete` rejects it (junk) and
-  advances; `←`/`→` navigate without deciding; `z` undoes the last decision; `enter` saves an
-  orientation correction annotation (see above) and also accepts.
+- `enter` accepts the current particle and advances - or, if you've clicked a base/apex annotation
+  on any panel (see above), saves that correction and accepts in the same motion; `Backspace`/
+  `Delete` rejects (junk) and advances; `←`/`→` navigate without deciding; `z` undoes the last
+  decision (or correction).
 - Decisions and corrections are saved continuously to `data_dir/gps_review_inputs/decisions.json`
   and `corrections.json`, so a review session can be closed and resumed later without losing
   progress.
