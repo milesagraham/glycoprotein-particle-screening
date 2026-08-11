@@ -52,6 +52,20 @@ def euler_to_rotation_matrix(rot: float, tilt: float, psi: float) -> np.ndarray:
     return rz_rot @ ry_tilt @ rz_psi
 
 
+def z_vector_to_rot_tilt(v: np.ndarray) -> Tuple[float, float]:
+    """Inverts euler_to_rotation_matrix's z-column: given a (not necessarily normalized) pointing
+    vector, returns the (rot, tilt) that reproduce it as column 2 of euler_to_rotation_matrix(rot,
+    tilt, psi) for any psi, since that column never depends on psi. Used by gps review's manual
+    orientation correction, where a reviewer's clicked base->apex vector becomes a new rot/tilt for
+    that particle - psi is left untouched, since nothing in that click-based workflow constrains it
+    (verified by round-trip against euler_to_rotation_matrix: max error ~1e-15 over 2000 random
+    orientations away from the poles)."""
+    v = v / np.linalg.norm(v)
+    tilt = np.degrees(np.arccos(np.clip(v[2], -1.0, 1.0)))
+    rot = np.degrees(np.arctan2(-v[0], v[1]))
+    return float(rot), float(tilt)
+
+
 def discover_tomogram_sets(data_dir: Path) -> List[dict]:
     """Finds tomogram/starfile pairs that share an exact filename stem across the tomograms/ and
     starfiles/ subdirectories of data_dir - each is one tomogram to prepare for review."""

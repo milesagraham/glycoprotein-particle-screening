@@ -120,9 +120,37 @@ that collapsed to flat black instead of visible background speckle. Tune `--gaus
 
 Unlike `gps`'s predecessor tool (GCA, which compares a particle's orientation against an
 independently-fitted membrane normal), there's no second vector to compare a particle's orientation
-against here, so the panels don't draw an orientation arrow - the frame itself *is* the particle's
-orientation. The point of the close-up views is to let you pattern-match real particles vs. junk
-across a consistent, comparable presentation.
+against here, so the panels don't *automatically* draw an orientation arrow - the frame itself *is*
+the particle's orientation. The point of the close-up views is to let you pattern-match real
+particles vs. junk across a consistent, comparable presentation. The only arrows ever shown are the
+manual correction annotations described next - a genuinely different thing, drawn by you rather
+than derived from an orientation the tool already knows.
+
+#### Manually correcting a particle's orientation
+
+If a particle's pick is right but its orientation looks off, click a base point (on the membrane)
+then an apex point (on the particle) in any of the three raw close-up panels - top-down, side (x),
+side (y) - to draw a green base-to-apex vector. Press `enter` to save it and move on; saving a
+correction also accepts the particle in the same motion.
+
+You don't need to click all three panels. Each one only pins 2 of the pointing vector's 3
+lab-frame components (top-down measures its x/y lean, side (x) measures x/z, side (y) measures
+y/z), so a single panel leaves one component undetermined - a real ambiguity, not just imprecision.
+Clicking two panels that share an axis (e.g. both side panels share the pointing/z axis) gives two
+independent estimates of that shared component, averaged together for a more robust result. If only
+one view is legible for a given particle, a single-panel correction is better than none and is
+treated the same as any other correction - not flagged as lower-confidence.
+
+top-down is worth clicking too, not just the two side panels: for a badly misoriented particle,
+what's labeled "top-down" can end up visually looking like a side view, so it may show the apex
+direction more clearly than either of the panels nominally built for that.
+
+A correction only ever changes `rlnAngleRot`/`rlnAngleTilt` (baked into the exported STAR file for
+that particle) - `rlnAnglePsi` (in-plane rotation) is left exactly as picked, since nothing in this
+click-based workflow constrains it. Corrections persist to
+`data_dir/gps_review_inputs/corrections.json` alongside `decisions.json`, and are redrawn on all
+three panels whenever you revisit that particle. `z` undoes a correction the same way it undoes a
+plain accept/reject.
 
 #### Splitting compute from review on a cluster
 
@@ -148,8 +176,11 @@ Once `gps review` is running:
   ```
   then open `http://localhost:5050` locally.
 - `space` accepts the current particle and advances; `Backspace`/`Delete` rejects it (junk) and
-  advances; `←`/`→` navigate without deciding; `z` undoes the last decision.
-- Decisions are saved continuously to `data_dir/gps_review_inputs/decisions.json`, so a review
-  session can be closed and resumed later without losing progress.
+  advances; `←`/`→` navigate without deciding; `z` undoes the last decision; `enter` saves an
+  orientation correction annotation (see above) and also accepts.
+- Decisions and corrections are saved continuously to `data_dir/gps_review_inputs/decisions.json`
+  and `corrections.json`, so a review session can be closed and resumed later without losing
+  progress.
 - The "Export reviewed STAR files" button writes one `<stem>_reviewed.star` per tomogram
-  (accepted particles only) next to that tomogram's input STAR file.
+  (accepted particles only) next to that tomogram's input STAR file, with any manually corrected
+  `rlnAngleRot`/`rlnAngleTilt` baked in.
