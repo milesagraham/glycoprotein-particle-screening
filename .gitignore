@@ -37,5 +37,8 @@ Thumbs.db
 .idea/
 .vscode/
 
+# Local project notes for Claude Code sessions - not for the public repo
+.claude/CLAUDE.md
+
 # Local test data (large/real-world files, kept out of git)
 test_materials/
