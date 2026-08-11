@@ -65,7 +65,8 @@ Pixel sizes are required since the tomogram and particle coordinates are often b
 | Option | Default | What it does |
 |---|---|---|
 | `--box-size-angstrom` | 300 Å | Width/height of the three close-up panels. |
-| `--context-box-size-angstrom` | 2000 Å | Width/height of the wider context panel. |
+| `--context-box-size-angstrom` | 2000 Å | Width/height of the two wider panels (context and traditional). |
+| `--slab-slices` | 1 (off) | Average this many parallel slices along each panel's own depth axis instead of one slice, to cut noise. |
 | `--workers` / `-j` | 4 | Number of tomograms rendered in parallel - they're fully independent of each other. `--workers 1` disables parallelism. |
 
 Run `gps prepare --help` for the full list.
@@ -95,18 +96,25 @@ Launches a local web app for fast, keyboard-driven manual triage. It only ever r
 start if `gps prepare` hasn't been run yet. Every particle from every prepared tomogram is combined
 into a single review queue.
 
-Each particle is shown as three panels in its own frame - a top-down view looking straight down the
-particle's own pointing axis, and two side views 90 degrees apart around that axis - next to a
-wider context view (same side-on orientation, zoomed out) showing where on the tomogram the pick
-sits, e.g. relative to a virus/vesicle surface:
+Each particle is shown as three close-up panels in its own frame - a top-down view looking straight
+down the particle's own pointing axis, and two side views 90 degrees apart around that axis - next
+to two wider panels:
+
+- **context** - oriented the same way as the "side (x)" close-up (i.e. still in the particle's own
+  rotated frame), zoomed out to show where on the tomogram the pick sits, e.g. relative to a
+  virus/vesicle surface.
+- **traditional** - the tomogram's own raw, un-rotated XY slice at the particle's position, the same
+  view you'd get scrolling through the tomogram in a standard viewer (IMOD, napari, etc.). Unlike
+  every other panel, its orientation doesn't depend on the particle at all, so it looks identical
+  across every particle in a tomogram - only where it's centered changes.
 
 ![Example: the same particle's wider context view](docs/example_idx0_context.png)
 
 Unlike `gps`'s predecessor tool (GCA, which compares a particle's orientation against an
 independently-fitted membrane normal), there's no second vector to compare a particle's orientation
 against here, so the panels don't draw an orientation arrow - the frame itself *is* the particle's
-orientation. The point of the three views is to let you pattern-match real particles vs. junk across
-a consistent, comparable presentation.
+orientation. The point of the close-up views is to let you pattern-match real particles vs. junk
+across a consistent, comparable presentation.
 
 #### Splitting compute from review on a cluster
 

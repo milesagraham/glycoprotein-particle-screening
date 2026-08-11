@@ -18,6 +18,20 @@ Design notes:
   consistent set of views.
 - There is no automatic accept/reject step - every particle in every matched tomogram/starfile pair
   goes into the manual review queue.
+- Raw tomogram slices are noisy, which makes it hard to tell where a membrane actually is,
+  especially in the top-down panel. `--slab-slices` (see gps.cli) averages several parallel slices
+  stepped along each panel's own depth axis (the axis that panel is looking down) instead of a
+  single slice - noise averages down while a real, only-mildly-curved feature like a membrane stays
+  roughly in place across nearby depths, so this mostly boosts contrast rather than smearing
+  structure. Off (a single ordinary slice) by default; tried at --slab-slices 10 and found not to
+  make a clear enough difference to be worth it yet, so it's parked at the default rather than
+  pursued further for now.
+- There are two wide panels, not one: "context" is oriented the same way as the "side (x)"
+  close-up (particle-frame axes), while "traditional" is the plain, un-rotated tomogram XY slice at
+  the particle's own position - what a reviewer would see scrolling through the raw tomogram in a
+  standard viewer, unaffected by this particle's orientation. Added because the context panel's
+  oblique, per-particle-rotated cut made it hard to relate a pick back to the tomogram a reviewer
+  already knows how to read.
 - Re-running `gps prepare` skips any tomogram whose input files and parameters are unchanged since
   the last run (fingerprinted in gps_review_inputs/<stem>/fingerprint.txt), so an interrupted batch
   job can be resubmitted without repeating already-finished tomograms.
@@ -44,8 +58,14 @@ BOX_PIXELS = 170
 #wider single-slice context view, oriented the same way as the xz close-up panel, showing where on
 #the wider tomogram (e.g. a virus/vesicle surface) a pick sits - sampled close to the tomogram's
 #native pixel size rather than oversampled, since there's no benefit interpolating finer than the
-#data at this scale
+#data at this scale. The traditional panel uses the same box/pixel size but the tomogram's own raw
+#axes instead - the plain, un-rotated XY view a reviewer would get scrolling through the tomogram
+#in a standard viewer, unaffected by anything about this particle's own orientation
 CONTEXT_BOX_PIXELS = 220
+
+LAB_X = np.array([1.0, 0.0, 0.0])
+LAB_Y = np.array([0.0, 1.0, 0.0])
+LAB_Z = np.array([0.0, 0.0, 1.0])
 
 
 def _file_fingerprint(path: Path) -> str:
@@ -71,6 +91,23 @@ def _extract_slice(tomo: np.ndarray, center: np.ndarray, axis1: np.ndarray, axis
               + grid_b[..., None] * axis2[None, None, :])
     coords = np.stack([points[..., 2], points[..., 1], points[..., 0]], axis=0)  # z,y,x order
     return map_coordinates(tomo, coords, order=1, mode='nearest')
+
+
+def _extract_slab(tomo: np.ndarray, center: np.ndarray, axis1: np.ndarray, axis2: np.ndarray,
+                   axis_normal: np.ndarray, grid_a: np.ndarray, grid_b: np.ndarray,
+                   n_slices: int) -> np.ndarray:
+    """Averages n_slices parallel single-voxel-spaced slices, stepped along axis_normal (the axis
+    the panel is looking down) and centered on `center`, instead of returning just the one slice
+    through `center` itself. Raw tomogram slices are dominated by shot noise, which averages down
+    while a real, locally-planar feature like a membrane - only mildly curved over a few voxels -
+    stays roughly in place across nearby depths, so this mainly boosts contrast rather than
+    smearing genuine structure. n_slices <= 1 is a single ordinary slice."""
+    if n_slices <= 1:
+        return _extract_slice(tomo, center, axis1, axis2, grid_a, grid_b)
+    offsets = np.arange(n_slices) - (n_slices - 1) / 2.0
+    slices = [_extract_slice(tomo, center + offset * axis_normal, axis1, axis2, grid_a, grid_b)
+              for offset in offsets]
+    return np.mean(slices, axis=0)
 
 
 def _draw_panel(ax, img: np.ndarray, box_a: float, title: str) -> None:
@@ -121,7 +158,7 @@ def _save_context_panel(path: Path, img: np.ndarray, box_a: float) -> None:
 
 def render_review_data_for_tomogram(
     tomo_set: dict, inputs_dir: Path, particles_apx: float, tomo_apx: float,
-    box_size_angstrom: float, context_box_size_angstrom: float,
+    box_size_angstrom: float, context_box_size_angstrom: float, slab_slices: int,
 ) -> List[dict]:
     """Called from `gps prepare` (in gps.cli), never directly by this module's own CLI command.
     Renders a review image for every particle in one tomogram's STAR file. Writes one
@@ -141,7 +178,7 @@ def render_review_data_for_tomogram(
 
     params = dict(particles_apx=particles_apx, tomo_apx=tomo_apx,
                   box_size_angstrom=box_size_angstrom,
-                  context_box_size_angstrom=context_box_size_angstrom)
+                  context_box_size_angstrom=context_box_size_angstrom, slab_slices=slab_slices)
     fingerprint = _tomogram_fingerprint(tomo_set, params)
     if records_path.exists() and fingerprint_path.exists() and fingerprint_path.read_text().strip() == fingerprint:
         records = json.loads(records_path.read_text())["records"]
@@ -183,16 +220,22 @@ def render_review_data_for_tomogram(
         frame = euler_to_rotation_matrix(rot, tilt, psi)
         x_axis, y_axis, z_axis = frame[:, 0], frame[:, 1], frame[:, 2]
 
-        img_xy = _extract_slice(tomo, pos, x_axis, y_axis, grid_a, grid_b)
-        img_xz = _extract_slice(tomo, pos, x_axis, z_axis, grid_a, grid_b)
-        img_yz = _extract_slice(tomo, pos, y_axis, z_axis, grid_a, grid_b)
+        img_xy = _extract_slab(tomo, pos, x_axis, y_axis, z_axis, grid_a, grid_b, slab_slices)
+        img_xz = _extract_slab(tomo, pos, x_axis, z_axis, y_axis, grid_a, grid_b, slab_slices)
+        img_yz = _extract_slab(tomo, pos, y_axis, z_axis, x_axis, grid_a, grid_b, slab_slices)
 
         filename = f"idx{i}.png"
         _save_review_panel(stem_dir / filename, img_xy, img_xz, img_yz, box_size_angstrom)
 
-        context_img = _extract_slice(tomo, pos, x_axis, z_axis, context_grid_a, context_grid_b)
+        context_img = _extract_slab(tomo, pos, x_axis, z_axis, y_axis, context_grid_a,
+                                    context_grid_b, slab_slices)
         context_filename = f"idx{i}_context.png"
         _save_context_panel(stem_dir / context_filename, context_img, context_box_size_angstrom)
+
+        traditional_img = _extract_slab(tomo, pos, LAB_X, LAB_Y, LAB_Z, context_grid_a,
+                                        context_grid_b, slab_slices)
+        traditional_filename = f"idx{i}_traditional.png"
+        _save_context_panel(stem_dir / traditional_filename, traditional_img, context_box_size_angstrom)
 
         records.append(dict(
             key=f"{stem}:{i}", stem=stem, idx=i,
@@ -200,6 +243,7 @@ def render_review_data_for_tomogram(
             rot=round(float(rot), 2), tilt=round(float(tilt), 2), psi=round(float(psi), 2),
             image=f"/api/image/{stem}/{filename}",
             context_image=f"/api/image/{stem}/{context_filename}",
+            traditional_image=f"/api/image/{stem}/{traditional_filename}",
         ))
 
     typer.echo(f"[{stem}] {len(records)} review images ready.")
@@ -298,20 +342,21 @@ INDEX_HTML = r"""<!doctype html>
   header h1 { font-size: 15px; font-weight: 600; margin: 0; color: var(--ink-soft); letter-spacing: 0.02em; }
   #counts { font-family: ui-monospace, monospace; font-size: 13px; color: var(--ink-soft); }
   #counts b.acc { color: var(--teal); } #counts b.rej { color: var(--crimson); }
-  main { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; padding: 16px; gap: 28px; }
+  main { flex: 1; display: flex; flex-wrap: wrap; align-items: center; justify-content: center;
+         min-height: 0; padding: 16px; gap: 14px; }
   #imgwrap { position: relative; border: 3px solid var(--line); border-radius: 10px; overflow: hidden;
              transition: border-color 0.1s; line-height: 0; background: #14191a; }
   #imgwrap.acc { border-color: var(--teal); } #imgwrap.rej { border-color: var(--crimson); }
-  #img { max-height: 62vh; max-width: 58vw; display: block; }
+  #img { max-height: 52vh; max-width: 34vw; display: block; }
   #badge { position: absolute; top: 10px; right: 10px; padding: 3px 10px; border-radius: 5px;
            font-size: 12px; font-weight: 600; letter-spacing: 0.03em; display: none; }
   #badge.acc { display: block; background: var(--teal); color: #06201d; }
   #badge.rej { display: block; background: var(--crimson); color: #2a0508; }
-  #ctxcol { display: flex; flex-direction: column; align-items: center; gap: 8px; flex-shrink: 0; }
-  #ctxwrap { border: 2px solid var(--line); border-radius: 8px; overflow: hidden; line-height: 0;
-             background: #14191a; }
-  #ctximg { max-height: 46vh; max-width: 26vw; display: block; }
-  #ctxlabel { font-size: 11px; color: var(--ink-soft); letter-spacing: 0.05em; text-transform: uppercase; }
+  .side-col { display: flex; flex-direction: column; align-items: center; gap: 8px; flex-shrink: 0; }
+  .side-wrap { border: 2px solid var(--line); border-radius: 8px; overflow: hidden; line-height: 0;
+               background: #14191a; }
+  .side-img { max-height: 32vh; max-width: 14vw; display: block; }
+  .side-label { font-size: 11px; color: var(--ink-soft); letter-spacing: 0.05em; text-transform: uppercase; }
   #meta { width: 260px; font-size: 14px; line-height: 2.1; flex-shrink: 0; }
   #meta .row { display: flex; justify-content: space-between; border-bottom: 1px solid var(--line); padding: 2px 0; }
   #meta .label { color: var(--ink-soft); }
@@ -338,9 +383,13 @@ INDEX_HTML = r"""<!doctype html>
 <div id="progress-bar"><div id="progress-fill"></div></div>
 <main>
   <div id="imgwrap"><img id="img" src=""><div id="badge"></div></div>
-  <div id="ctxcol">
-    <div id="ctxwrap"><img id="ctximg" src=""></div>
-    <div id="ctxlabel">context</div>
+  <div class="side-col">
+    <div class="side-wrap"><img class="side-img" id="ctximg" src=""></div>
+    <div class="side-label">context (particle-oriented)</div>
+  </div>
+  <div class="side-col">
+    <div class="side-wrap"><img class="side-img" id="tradimg" src=""></div>
+    <div class="side-label">traditional (tomogram xy)</div>
   </div>
   <div id="meta">
     <h2 id="m-title">-</h2>
@@ -383,6 +432,7 @@ function render() {
   const r = queue[idx];
   document.getElementById('img').src = r.image;
   document.getElementById('ctximg').src = r.context_image;
+  document.getElementById('tradimg').src = r.traditional_image;
   document.getElementById('m-title').innerText = r.stem;
   document.getElementById('m-idx').innerText = r.idx;
   document.getElementById('m-lcc').innerText = (r.lcc === null ? '-' : r.lcc.toFixed(2));
@@ -407,6 +457,7 @@ function prefetch() {
     if (queue[idx + k]) {
       const im = new Image(); im.src = queue[idx + k].image;
       const ctxIm = new Image(); ctxIm.src = queue[idx + k].context_image;
+      const tradIm = new Image(); tradIm.src = queue[idx + k].traditional_image;
     }
   }
 }

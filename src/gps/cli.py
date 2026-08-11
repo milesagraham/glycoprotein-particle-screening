@@ -78,7 +78,7 @@ def discover_tomogram_sets(data_dir: Path) -> List[dict]:
 
 def _process_tomogram_for_prepare(
     tomo_set: dict, inputs_dir: Path, particles_apx: float, tomo_apx: float,
-    box_size_angstrom: float, context_box_size_angstrom: float,
+    box_size_angstrom: float, context_box_size_angstrom: float, slab_slices: int,
 ) -> dict:
     """Renders review images for every particle in one tomogram and writes them to
     inputs_dir/<stem>/. Returns a small summary dict for the CLI's own progress reporting."""
@@ -88,6 +88,7 @@ def _process_tomogram_for_prepare(
     from gps.review import render_review_data_for_tomogram
     records = render_review_data_for_tomogram(
         tomo_set, inputs_dir, particles_apx, tomo_apx, box_size_angstrom, context_box_size_angstrom,
+        slab_slices,
     )
     return dict(stem=tomo_set['stem'], n_particles=len(records))
 
@@ -107,6 +108,14 @@ def prepare(
     context_box_size_angstrom: Annotated[
         float, typer.Option("--context-box-size-angstrom",
                              help="Width/height in Angstroms of the wider context panel")] = 2000.0,
+    slab_slices: Annotated[
+        int, typer.Option("--slab-slices",
+                           help="Average this many parallel, single-voxel-spaced slices (stepped "
+                                "along each panel's own depth axis, centered on the particle) "
+                                "instead of rendering a single noisy slice - boosts contrast on "
+                                "membrane-like features without much smearing, since a real "
+                                "feature stays roughly in place across nearby depths while noise "
+                                "doesn't. 1 (the default) renders a single ordinary slice.")] = 1,
     workers: Annotated[
         int, typer.Option("--workers", "-j",
                            help="Number of tomograms to render in parallel (they're fully "
@@ -142,6 +151,10 @@ def prepare(
                    f"got {context_box_size_angstrom}", err=True)
         raise typer.Exit(code=1)
 
+    if slab_slices < 1:
+        typer.echo(f"Input Error: --slab-slices must be at least 1, got {slab_slices}", err=True)
+        raise typer.Exit(code=1)
+
     if workers < 1:
         typer.echo("Input Error: --workers must be at least 1", err=True)
         raise typer.Exit(code=1)
@@ -160,7 +173,7 @@ def prepare(
     process_one = functools.partial(
         _process_tomogram_for_prepare, inputs_dir=inputs_dir, particles_apx=particles_apx,
         tomo_apx=tomo_apx, box_size_angstrom=box_size_angstrom,
-        context_box_size_angstrom=context_box_size_angstrom,
+        context_box_size_angstrom=context_box_size_angstrom, slab_slices=slab_slices,
     )
     if workers == 1 or len(tomo_sets) == 1:
         summaries = [process_one(tomo_set) for tomo_set in tomo_sets]
