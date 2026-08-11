@@ -18,9 +18,9 @@ Design notes:
   vector. The only arrows ever shown are the manual correction annotations described below, which
   are a genuinely different thing - user-drawn, not derived from the particle's already-known
   orientation, and can point anywhere. Don't conflate the two or reintroduce the automatic kind.
-- Manual orientation correction: all three raw-row panels (top-down, side (x), side (y) - not the
-  thresholded row) are click-annotatable in the UI. A reviewer clicks a base point then an apex
-  point (membrane -> particle) in any subset of the three; each panel's click only pins 2 of the
+- Manual orientation correction: all three close-up panels (top-down, side (x), side (y)) are
+  click-annotatable in the UI. A reviewer clicks a base point then an apex point (membrane ->
+  particle) in any subset of the three; each panel's click only pins 2 of the
   pointing vector's 3 lab-frame components (top-down: x & y; side (x): x & z; side (y): y & z), so
   a single panel leaves one component undetermined - a real ambiguity, not just imprecision.
   top-down is deliberately included even though it contributes nothing when the particle's current
@@ -53,16 +53,12 @@ Design notes:
   standard viewer, unaffected by this particle's orientation. Added because the context panel's
   oblique, per-particle-rotated cut made it hard to relate a pick back to the tomogram a reviewer
   already knows how to read.
-- Every panel is rendered twice: once as the raw slice (percentile-stretched, as before), and once
-  thresholded (`_apply_threshold`) - shown as a second row below the raw one in the UI, not a
-  replacement. Thresholding first tried CLAHE (adaptive histogram equalization), which was rejected
-  after visual review - it boosts local contrast everywhere, which amplified background noise right
-  along with real structure instead of separating the two. What's there now (`--gaussian-sigma`,
-  `--threshold-percentile` in gps.cli) blurs first, then clips the display range so only the
-  densest upper slice of the (blurred) intensity range shows at all - background collapses to flat
-  black rather than visible speckle. Purely a rendering choice for the reviewer's eyes; never feeds
-  back into what gets shown or any accept/reject logic, and the raw panel is always kept alongside
-  it so nothing is hidden.
+- There used to be a second, "thresholded" row below the raw one (Gaussian blur + percentile
+  clipping, and before that CLAHE) meant to help tell particle density apart from background noise.
+  Both were tried, shown to the user, and judged not to actually help - removed entirely (rendering
+  function, CLI options, dependency, UI row) rather than kept as an unused option. Don't re-add
+  either without new user-driven motivation; see git history if a future request wants a similar
+  idea revisited.
 - Re-running `gps prepare` skips any tomogram whose input files and parameters are unchanged since
   the last run (fingerprinted in gps_review_inputs/<stem>/fingerprint.txt - this includes
   PANEL_VERSION, bumped whenever the set of files/fields written per particle changes, so an older
@@ -74,14 +70,14 @@ Design notes:
 import hashlib
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import mrcfile
 import starfile
 import typer
 from typing_extensions import Annotated
-from scipy.ndimage import gaussian_filter, map_coordinates
+from scipy.ndimage import map_coordinates
 
 from gps.cli import app, load_star_data, euler_to_rotation_matrix, z_vector_to_rot_tilt
 
@@ -103,7 +99,7 @@ LAB_Z = np.array([0.0, 0.0, 1.0])
 #bump whenever the set of files/fields render_review_data_for_tomogram writes per particle changes,
 #so a cache written by an older version (same input files/params, different output shape) is
 #correctly treated as stale instead of being silently reused missing the new fields
-PANEL_VERSION = 3
+PANEL_VERSION = 4
 
 #how long, as a fraction of box_size_angstrom, the redrawn correction arrow appears on each panel
 #for a fully-aligned (direction-cosine 1.0) component - see build_review_app's /api/correct
@@ -152,70 +148,18 @@ def _extract_slab(tomo: np.ndarray, center: np.ndarray, axis1: np.ndarray, axis2
     return np.mean(slices, axis=0)
 
 
-def _apply_threshold(img: np.ndarray, gaussian_sigma: float, threshold_percentile: float) -> np.ndarray:
-    """Suppresses background noise so particle-like density stands out, instead of stretching
-    contrast everywhere the way CLAHE does (tried first - amplified noise right along with real
-    structure, judged not useful after visual review). A Gaussian blur first smooths out
-    pixel-level shot noise; the display range is then clipped so only the upper
-    (100 - threshold_percentile) percent of the (smoothed) intensity range is shown at all -
-    background below that collapses to flat black instead of visible speckle, while what's left
-    gets stretched to full contrast. Returns values in [0, 1]. This is a rendering choice, not a
-    detector - it never feeds back into which particles get shown or any accept/reject decision,
-    and the raw, unthresholded panel is always shown alongside it, never replaced."""
-    smoothed = gaussian_filter(img, sigma=gaussian_sigma) if gaussian_sigma > 0 else img
-    lo, hi = np.percentile(smoothed, [threshold_percentile, 99.5])
-    if hi - lo < 1e-6:
-        return np.zeros_like(smoothed)
-    clipped = np.clip(smoothed, lo, hi)
-    return (clipped - lo) / (hi - lo)
-
-
-def _draw_panel(ax, img: np.ndarray, box_a: float, title: str,
-                 vmin: Optional[float] = None, vmax: Optional[float] = None) -> None:
-    if vmin is None or vmax is None:
-        vmin, vmax = np.percentile(img, [1, 99])
-    ax.imshow(img, origin='lower', cmap='gray', vmin=vmin, vmax=vmax,
-              extent=[-box_a / 2, box_a / 2, -box_a / 2, box_a / 2])
-    ax.scatter(0, 0, c='#f9a825', s=90, marker='+', linewidth=2.2, zorder=5)
-    ax.set_title(title, fontsize=10, color='#c7d0d1')
-    ax.set_xticks([]); ax.set_yticks([])
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-
-
-def _save_review_panel(path: Path, img_xy: np.ndarray, img_xz: np.ndarray, img_yz: np.ndarray,
-                        box_a: float, vmin: Optional[float] = None, vmax: Optional[float] = None) -> None:
-    """Renders the three orthogonal views of the particle's own local frame: xy (looking down the
-    particle's own pointing axis), and the two side views xz/yz, 90 degrees apart around it.
-    vmin/vmax are passed through explicitly (rather than each panel computing its own percentile
-    stretch) when rendering already-normalized thresholded output, which should be displayed as-is."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4.2), facecolor='#14191a')
-    _draw_panel(axes[0], img_xy, box_a, "top-down (along particle axis)", vmin, vmax)
-    _draw_panel(axes[1], img_xz, box_a, "side (x)", vmin, vmax)
-    _draw_panel(axes[2], img_yz, box_a, "side (y)", vmin, vmax)
-    fig.tight_layout(pad=0.6)
-    fig.savefig(path, dpi=105, facecolor=fig.get_facecolor(), bbox_inches='tight', pad_inches=0.08)
-    plt.close(fig)
-
-
-def _save_single_panel(path: Path, img: np.ndarray, box_a: float, pixels: int,
-                        vmin: Optional[float] = None, vmax: Optional[float] = None) -> None:
+def _save_single_panel(path: Path, img: np.ndarray, box_a: float, pixels: int) -> None:
     """Saves one clean panel - no title, ticks, spines, or padding, just the image and the amber
     crosshair - filling the figure edge-to-edge at an exact pixel size, so a browser click on the
     resulting PNG maps back to an Angstrom position by simple linear interpolation (no tight-bbox
-    cropping uncertainty to account for). Used only for the raw side (x)/side (y)/top-down panels,
-    which is what the review UI's click-to-correct-orientation workflow needs pixel-accurate
-    coordinates from (see build_review_app's /api/correct)."""
+    cropping uncertainty to account for). Used for the top-down/side (x)/side (y) panels, which is
+    what the review UI's click-to-correct-orientation workflow needs pixel-accurate coordinates
+    from (see build_review_app's /api/correct)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    if vmin is None or vmax is None:
-        vmin, vmax = np.percentile(img, [1, 99])
+    vmin, vmax = np.percentile(img, [1, 99])
     dpi = 100
     fig = plt.figure(figsize=(pixels / dpi, pixels / dpi), dpi=dpi, facecolor='#14191a')
     ax = fig.add_axes([0, 0, 1, 1])
@@ -229,14 +173,12 @@ def _save_single_panel(path: Path, img: np.ndarray, box_a: float, pixels: int,
     plt.close(fig)
 
 
-def _save_context_panel(path: Path, img: np.ndarray, box_a: float,
-                         vmin: Optional[float] = None, vmax: Optional[float] = None) -> None:
+def _save_context_panel(path: Path, img: np.ndarray, box_a: float) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    if vmin is None or vmax is None:
-        vmin, vmax = np.percentile(img, [1, 99])
+    vmin, vmax = np.percentile(img, [1, 99])
     fig, ax = plt.subplots(figsize=(4.6, 4.6), facecolor='#14191a')
     ax.imshow(img, origin='lower', cmap='gray', vmin=vmin, vmax=vmax,
               extent=[-box_a / 2, box_a / 2, -box_a / 2, box_a / 2])
@@ -252,7 +194,6 @@ def _save_context_panel(path: Path, img: np.ndarray, box_a: float,
 def render_review_data_for_tomogram(
     tomo_set: dict, inputs_dir: Path, particles_apx: float, tomo_apx: float,
     box_size_angstrom: float, context_box_size_angstrom: float, slab_slices: int,
-    gaussian_sigma: float, threshold_percentile: float,
 ) -> List[dict]:
     """Called from `gps prepare` (in gps.cli), never directly by this module's own CLI command.
     Renders a review image for every particle in one tomogram's STAR file. Writes one
@@ -273,7 +214,6 @@ def render_review_data_for_tomogram(
     params = dict(particles_apx=particles_apx, tomo_apx=tomo_apx,
                   box_size_angstrom=box_size_angstrom,
                   context_box_size_angstrom=context_box_size_angstrom, slab_slices=slab_slices,
-                  gaussian_sigma=gaussian_sigma, threshold_percentile=threshold_percentile,
                   panel_version=PANEL_VERSION)
     fingerprint = _tomogram_fingerprint(tomo_set, params)
     if records_path.exists() and fingerprint_path.exists() and fingerprint_path.read_text().strip() == fingerprint:
@@ -320,9 +260,9 @@ def render_review_data_for_tomogram(
         img_xz = _extract_slab(tomo, pos, x_axis, z_axis, y_axis, grid_a, grid_b, slab_slices)
         img_yz = _extract_slab(tomo, pos, y_axis, z_axis, x_axis, grid_a, grid_b, slab_slices)
 
-        #saved as 3 separate clean-edge images (not one composite, unlike the enhanced row below)
-        #so a click in the review UI's side (x)/side (y) panel maps back to an exact Angstrom
-        #position - see _save_single_panel and build_review_app's /api/correct
+        #saved as 3 separate clean-edge images, not one composite, so a click in the review UI's
+        #top-down/side (x)/side (y) panel maps back to an exact Angstrom position - see
+        #_save_single_panel and build_review_app's /api/correct
         topdown_filename = f"idx{i}_topdown.png"
         sidex_filename = f"idx{i}_sidex.png"
         sidey_filename = f"idx{i}_sidey.png"
@@ -330,30 +270,15 @@ def render_review_data_for_tomogram(
         _save_single_panel(stem_dir / sidex_filename, img_xz, box_size_angstrom, BOX_PIXELS)
         _save_single_panel(stem_dir / sidey_filename, img_yz, box_size_angstrom, BOX_PIXELS)
 
-        def threshold(im: np.ndarray) -> np.ndarray:
-            return _apply_threshold(im, gaussian_sigma, threshold_percentile)
-
-        enhanced_filename = f"idx{i}_enhanced.png"
-        _save_review_panel(stem_dir / enhanced_filename, threshold(img_xy), threshold(img_xz),
-                           threshold(img_yz), box_size_angstrom, vmin=0.0, vmax=1.0)
-
         context_img = _extract_slab(tomo, pos, x_axis, z_axis, y_axis, context_grid_a,
                                     context_grid_b, slab_slices)
         context_filename = f"idx{i}_context.png"
         _save_context_panel(stem_dir / context_filename, context_img, context_box_size_angstrom)
 
-        context_enhanced_filename = f"idx{i}_context_enhanced.png"
-        _save_context_panel(stem_dir / context_enhanced_filename, threshold(context_img),
-                            context_box_size_angstrom, vmin=0.0, vmax=1.0)
-
         traditional_img = _extract_slab(tomo, pos, LAB_X, LAB_Y, LAB_Z, context_grid_a,
                                         context_grid_b, slab_slices)
         traditional_filename = f"idx{i}_traditional.png"
         _save_context_panel(stem_dir / traditional_filename, traditional_img, context_box_size_angstrom)
-
-        traditional_enhanced_filename = f"idx{i}_traditional_enhanced.png"
-        _save_context_panel(stem_dir / traditional_enhanced_filename, threshold(traditional_img),
-                            context_box_size_angstrom, vmin=0.0, vmax=1.0)
 
         records.append(dict(
             key=f"{stem}:{i}", stem=stem, idx=i,
@@ -363,11 +288,8 @@ def render_review_data_for_tomogram(
             image_topdown=f"/api/image/{stem}/{topdown_filename}",
             image_sidex=f"/api/image/{stem}/{sidex_filename}",
             image_sidey=f"/api/image/{stem}/{sidey_filename}",
-            image_enhanced=f"/api/image/{stem}/{enhanced_filename}",
             context_image=f"/api/image/{stem}/{context_filename}",
-            context_image_enhanced=f"/api/image/{stem}/{context_enhanced_filename}",
             traditional_image=f"/api/image/{stem}/{traditional_filename}",
-            traditional_image_enhanced=f"/api/image/{stem}/{traditional_enhanced_filename}",
         ))
 
     typer.echo(f"[{stem}] {len(records)} review images ready.")
@@ -553,24 +475,17 @@ INDEX_HTML = r"""<!doctype html>
   header h1 { font-size: 15px; font-weight: 600; margin: 0; color: var(--ink-soft); letter-spacing: 0.02em; }
   #counts { font-family: ui-monospace, monospace; font-size: 13px; color: var(--ink-soft); }
   #counts b.acc { color: var(--teal); } #counts b.rej { color: var(--crimson); }
-  main { flex: 1; display: grid; grid-template-columns: max-content 260px;
-         grid-template-areas: "row1 meta" "row2 meta"; align-items: center; justify-content: center;
-         gap: 12px 32px; min-height: 0; padding: 16px; overflow-y: auto; }
-  .image-block { display: flex; flex-direction: column; align-items: center; gap: 6px; }
-  .image-block.raw { grid-area: row1; }
-  .image-block.enhanced { grid-area: row2; }
-  .block-label { align-self: flex-start; font-size: 11px; color: var(--ink-soft);
+  main { flex: 1; display: flex; align-items: center; justify-content: center;
+         gap: 28px; min-height: 0; padding: 16px; overflow-y: auto; flex-wrap: wrap; }
+  .raw-block { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+  .block-label { align-self: flex-start; font-size: 12px; color: var(--ink-soft);
                  letter-spacing: 0.06em; text-transform: uppercase; margin-left: 2px; }
-  .image-row { display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap; }
-  .main-wrap { border-radius: 10px; overflow: hidden; line-height: 0; background: #14191a; }
-  .main-img { max-height: 30vh; max-width: 30vw; display: block; }
-  #imgwrap-enh { border: 3px solid var(--line); }
-  .raw-group { display: flex; gap: 3px; position: relative; border: 3px solid var(--line);
+  .raw-group { display: flex; gap: 4px; position: relative; border: 3px solid var(--line);
                border-radius: 10px; overflow: hidden; background: #14191a; transition: border-color 0.1s; }
   .raw-group.acc { border-color: var(--teal); } .raw-group.rej { border-color: var(--crimson); }
-  .panel-cell { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 6px 4px 8px; }
+  .panel-cell { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 8px 12px; }
   .panel-inner { position: relative; line-height: 0; }
-  .panel-img { display: block; max-height: 22vh; max-width: 15vw; }
+  .panel-img { display: block; width: min(40vh, 17vw); aspect-ratio: 1 / 1; }
   .anno-svg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
   #svg-topdown, #svg-sidex, #svg-sidey { cursor: crosshair; }
   .anno-line { stroke: #7ee787; stroke-width: 2.5; }
@@ -580,17 +495,17 @@ INDEX_HTML = r"""<!doctype html>
            font-size: 12px; font-weight: 600; letter-spacing: 0.03em; display: none; z-index: 2; }
   #badge.acc { display: block; background: var(--teal); color: #06201d; }
   #badge.rej { display: block; background: var(--crimson); color: #2a0508; }
-  .side-col { display: flex; flex-direction: column; align-items: center; gap: 6px; flex-shrink: 0; }
+  .side-col { display: flex; flex-direction: column; align-items: center; gap: 8px; flex-shrink: 0; }
   .side-wrap { border: 2px solid var(--line); border-radius: 8px; overflow: hidden; line-height: 0;
                background: #14191a; }
-  .side-img { max-height: 20vh; max-width: 13vw; display: block; }
-  .side-label { font-size: 11px; color: var(--ink-soft); letter-spacing: 0.05em; text-transform: uppercase; }
-  #meta { grid-area: meta; align-self: center; width: 260px; font-size: 14px; line-height: 2.1; flex-shrink: 0; }
-  #meta .row { display: flex; justify-content: space-between; border-bottom: 1px solid var(--line); padding: 2px 0; }
+  .side-img { display: block; width: min(40vh, 17vw); aspect-ratio: 1 / 1; }
+  .side-label { font-size: 12px; color: var(--ink-soft); letter-spacing: 0.05em; text-transform: uppercase; }
+  #meta { width: 280px; font-size: 15px; line-height: 2.2; flex-shrink: 0; }
+  #meta .row { display: flex; justify-content: space-between; border-bottom: 1px solid var(--line); padding: 3px 0; }
   #meta .label { color: var(--ink-soft); }
   #meta .val { font-family: ui-monospace, monospace; }
   #meta .val.corrected { color: var(--teal); }
-  #meta h2 { font-size: 20px; margin: 0 0 14px; font-weight: 600; }
+  #meta h2 { font-size: 22px; margin: 0 0 16px; font-weight: 600; }
   #progress-bar { height: 4px; background: var(--line); flex-shrink: 0; }
   #progress-fill { height: 100%; background: var(--teal); width: 0%; transition: width 0.15s; }
   footer { display: flex; justify-content: space-between; align-items: center; padding: 12px 24px;
@@ -611,56 +526,40 @@ INDEX_HTML = r"""<!doctype html>
 </header>
 <div id="progress-bar"><div id="progress-fill"></div></div>
 <main>
-  <div class="image-block raw">
-    <div class="block-label">raw &middot; click base then apex on any panel(s) to annotate, enter to accept</div>
-    <div class="image-row">
-      <div class="raw-group" id="imgwrap">
-        <div class="panel-cell">
-          <div class="panel-inner">
-            <img class="panel-img" id="img-topdown" src="">
-            <svg class="anno-svg" id="svg-topdown" viewBox="0 0 100 100" preserveAspectRatio="none"></svg>
-          </div>
-          <div class="side-label">top-down (along particle axis)</div>
+  <div class="raw-block">
+    <div class="block-label">click base then apex on any panel(s) to annotate, enter to accept</div>
+    <div class="raw-group" id="imgwrap">
+      <div class="panel-cell">
+        <div class="panel-inner">
+          <img class="panel-img" id="img-topdown" src="">
+          <svg class="anno-svg" id="svg-topdown" viewBox="0 0 100 100" preserveAspectRatio="none"></svg>
         </div>
-        <div class="panel-cell">
-          <div class="panel-inner">
-            <img class="panel-img" id="img-sidex" src="">
-            <svg class="anno-svg" id="svg-sidex" viewBox="0 0 100 100" preserveAspectRatio="none"></svg>
-          </div>
-          <div class="side-label">side (x)</div>
+        <div class="side-label">top-down (along particle axis)</div>
+      </div>
+      <div class="panel-cell">
+        <div class="panel-inner">
+          <img class="panel-img" id="img-sidex" src="">
+          <svg class="anno-svg" id="svg-sidex" viewBox="0 0 100 100" preserveAspectRatio="none"></svg>
         </div>
-        <div class="panel-cell">
-          <div class="panel-inner">
-            <img class="panel-img" id="img-sidey" src="">
-            <svg class="anno-svg" id="svg-sidey" viewBox="0 0 100 100" preserveAspectRatio="none"></svg>
-          </div>
-          <div class="side-label">side (y)</div>
+        <div class="side-label">side (x)</div>
+      </div>
+      <div class="panel-cell">
+        <div class="panel-inner">
+          <img class="panel-img" id="img-sidey" src="">
+          <svg class="anno-svg" id="svg-sidey" viewBox="0 0 100 100" preserveAspectRatio="none"></svg>
         </div>
-        <div id="badge"></div>
+        <div class="side-label">side (y)</div>
       </div>
-      <div class="side-col">
-        <div class="side-wrap"><img class="side-img" id="ctximg" src=""></div>
-        <div class="side-label">context (particle-oriented)</div>
-      </div>
-      <div class="side-col">
-        <div class="side-wrap"><img class="side-img" id="tradimg" src=""></div>
-        <div class="side-label">traditional (tomogram xy)</div>
-      </div>
+      <div id="badge"></div>
     </div>
   </div>
-  <div class="image-block enhanced">
-    <div class="block-label">thresholded (background suppressed)</div>
-    <div class="image-row">
-      <div class="main-wrap" id="imgwrap-enh"><img class="main-img" id="img-enh" src=""></div>
-      <div class="side-col">
-        <div class="side-wrap"><img class="side-img" id="ctximg-enh" src=""></div>
-        <div class="side-label">context</div>
-      </div>
-      <div class="side-col">
-        <div class="side-wrap"><img class="side-img" id="tradimg-enh" src=""></div>
-        <div class="side-label">traditional</div>
-      </div>
-    </div>
+  <div class="side-col">
+    <div class="side-wrap"><img class="side-img" id="ctximg" src=""></div>
+    <div class="side-label">context (particle-oriented)</div>
+  </div>
+  <div class="side-col">
+    <div class="side-wrap"><img class="side-img" id="tradimg" src=""></div>
+    <div class="side-label">traditional (tomogram xy)</div>
   </div>
   <div id="meta">
     <h2 id="m-title">-</h2>
@@ -808,9 +707,6 @@ function render() {
   document.getElementById('img-sidey').src = r.image_sidey;
   document.getElementById('ctximg').src = r.context_image;
   document.getElementById('tradimg').src = r.traditional_image;
-  document.getElementById('img-enh').src = r.image_enhanced;
-  document.getElementById('ctximg-enh').src = r.context_image_enhanced;
-  document.getElementById('tradimg-enh').src = r.traditional_image_enhanced;
   drawSavedCorrection(r);
   document.getElementById('m-title').innerText = r.stem;
   document.getElementById('m-idx').innerText = r.idx;
@@ -841,8 +737,8 @@ function prefetch() {
   for (let k = 1; k <= 3; k++) {
     const nr = queue[idx + k];
     if (nr) {
-      [nr.image_topdown, nr.image_sidex, nr.image_sidey, nr.context_image, nr.traditional_image,
-       nr.image_enhanced, nr.context_image_enhanced, nr.traditional_image_enhanced].forEach((src) => {
+      [nr.image_topdown, nr.image_sidex, nr.image_sidey, nr.context_image, nr.traditional_image
+      ].forEach((src) => {
         const im = new Image(); im.src = src;
       });
     }

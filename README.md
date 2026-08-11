@@ -67,8 +67,6 @@ Pixel sizes are required since the tomogram and particle coordinates are often b
 | `--box-size-angstrom` | 300 Å | Width/height of the three close-up panels. |
 | `--context-box-size-angstrom` | 2000 Å | Width/height of the two wider panels (context and traditional). |
 | `--slab-slices` | 1 (off) | Average this many parallel slices along each panel's own depth axis instead of one slice, to cut noise. |
-| `--gaussian-sigma` | 1.0 px | Blur applied before thresholding, on the second ("thresholded") panel row only. |
-| `--threshold-percentile` | 70.0 | On the thresholded row only: percentile of the (blurred) intensity range below which pixels show as flat black instead of background speckle. Higher = only the densest regions show. |
 | `--workers` / `-j` | 4 | Number of tomograms rendered in parallel - they're fully independent of each other. `--workers 1` disables parallelism. |
 
 Run `gps prepare --help` for the full list.
@@ -112,12 +110,6 @@ to two wider panels:
 
 ![Example: the same particle's wider context view](docs/example_idx0_context.png)
 
-All three close-up panels and both wide panels are rendered twice: once raw, and once thresholded
-(a second row below, in the same layout) - a Gaussian blur followed by clipping the display range so
-only the densest upper slice of the (blurred) intensity range shows at all, with everything below
-that collapsed to flat black instead of visible background speckle. Tune `--gaussian-sigma` and
-`--threshold-percentile` to your own data; the raw row is always kept alongside it, never replaced.
-
 Unlike `gps`'s predecessor tool (GCA, which compares a particle's orientation against an
 independently-fitted membrane normal), there's no second vector to compare a particle's orientation
 against here, so the panels don't *automatically* draw an orientation arrow - the frame itself *is*
@@ -129,7 +121,7 @@ than derived from an orientation the tool already knows.
 #### Manually correcting a particle's orientation
 
 If a particle's pick is right but its orientation looks off, click a base point (on the membrane)
-then an apex point (on the particle) in any of the three raw close-up panels - top-down, side (x),
+then an apex point (on the particle) in any of the three close-up panels - top-down, side (x),
 side (y) - to draw a green base-to-apex vector. Press `enter` to save it and move on; saving a
 correction also accepts the particle in the same motion.
 

@@ -93,7 +93,6 @@ def discover_tomogram_sets(data_dir: Path) -> List[dict]:
 def _process_tomogram_for_prepare(
     tomo_set: dict, inputs_dir: Path, particles_apx: float, tomo_apx: float,
     box_size_angstrom: float, context_box_size_angstrom: float, slab_slices: int,
-    gaussian_sigma: float, threshold_percentile: float,
 ) -> dict:
     """Renders review images for every particle in one tomogram and writes them to
     inputs_dir/<stem>/. Returns a small summary dict for the CLI's own progress reporting."""
@@ -103,7 +102,7 @@ def _process_tomogram_for_prepare(
     from gps.review import render_review_data_for_tomogram
     records = render_review_data_for_tomogram(
         tomo_set, inputs_dir, particles_apx, tomo_apx, box_size_angstrom, context_box_size_angstrom,
-        slab_slices, gaussian_sigma, threshold_percentile,
+        slab_slices,
     )
     return dict(stem=tomo_set['stem'], n_particles=len(records))
 
@@ -131,19 +130,6 @@ def prepare(
                                 "membrane-like features without much smearing, since a real "
                                 "feature stays roughly in place across nearby depths while noise "
                                 "doesn't. 1 (the default) renders a single ordinary slice.")] = 1,
-    gaussian_sigma: Annotated[
-        float, typer.Option("--gaussian-sigma",
-                             help="Standard deviation (in rendered pixels) of the Gaussian blur "
-                                  "applied before thresholding, on the second ('thresholded') panel "
-                                  "only - smooths out pixel-level shot noise so the threshold below "
-                                  "isn't just picking out noise spikes. 0 disables blurring.")] = 1.0,
-    threshold_percentile: Annotated[
-        float, typer.Option("--threshold-percentile",
-                             help="On the second ('thresholded') panel only: percentile of the "
-                                  "(blurred) intensity range below which pixels are shown as flat "
-                                  "black instead of visible background speckle. Higher values show "
-                                  "less - only the densest, most particle-like regions - lower "
-                                  "values keep more of the background visible.")] = 70.0,
     workers: Annotated[
         int, typer.Option("--workers", "-j",
                            help="Number of tomograms to render in parallel (they're fully "
@@ -183,15 +169,6 @@ def prepare(
         typer.echo(f"Input Error: --slab-slices must be at least 1, got {slab_slices}", err=True)
         raise typer.Exit(code=1)
 
-    if gaussian_sigma < 0:
-        typer.echo(f"Input Error: --gaussian-sigma must be non-negative, got {gaussian_sigma}", err=True)
-        raise typer.Exit(code=1)
-
-    if not 0 < threshold_percentile < 100:
-        typer.echo(f"Input Error: --threshold-percentile must be between 0 and 100, "
-                   f"got {threshold_percentile}", err=True)
-        raise typer.Exit(code=1)
-
     if workers < 1:
         typer.echo("Input Error: --workers must be at least 1", err=True)
         raise typer.Exit(code=1)
@@ -211,7 +188,6 @@ def prepare(
         _process_tomogram_for_prepare, inputs_dir=inputs_dir, particles_apx=particles_apx,
         tomo_apx=tomo_apx, box_size_angstrom=box_size_angstrom,
         context_box_size_angstrom=context_box_size_angstrom, slab_slices=slab_slices,
-        gaussian_sigma=gaussian_sigma, threshold_percentile=threshold_percentile,
     )
     if workers == 1 or len(tomo_sets) == 1:
         summaries = [process_one(tomo_set) for tomo_set in tomo_sets]
