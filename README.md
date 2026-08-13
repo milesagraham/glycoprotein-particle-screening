@@ -9,7 +9,7 @@ orientation (not a membrane normal - this tool does no membrane/segmentation ana
 picks can be compared side by side in a consistent frame regardless of where or how they sit in the
 tomogram.
 
-![Example: one particle rendered in its own frame - top-down along its own axis, and two side views 90 degrees apart](docs/example_idx0_panels.png)
+![Example: one particle rendered in its own frame - top-down along its own axis, and two side views 90 degrees apart](docs/example_idx21_panels.png)
 
 ## Installation
 
@@ -125,7 +125,7 @@ to two wider panels:
   every other panel, its orientation doesn't depend on the particle at all, so it looks identical
   across every particle in a tomogram - only where it's centered changes.
 
-![Example: the same particle's wider context view](docs/example_idx0_context.png)
+![Example: the same particle's wider context view](docs/example_idx21_context.png)
 
 Unlike `gps`'s predecessor tool (GCA, which compares a particle's orientation against an
 independently-fitted membrane normal), there's no second vector to compare a particle's orientation
